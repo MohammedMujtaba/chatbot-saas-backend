@@ -7,11 +7,11 @@ import {
   Param,
   Req,
   UseGuards,
-} from '@nestjs/common';
-import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
-import { BotsService } from './bots.service';
+} from "@nestjs/common";
+import { SupabaseJwtGuard } from "../auth/supabase-jwt.guard";
+import { BotsService } from "./bots.service";
 
-@Controller('bots')
+@Controller("bots")
 @UseGuards(SupabaseJwtGuard)
 export class BotsController {
   constructor(private botsService: BotsService) {}
@@ -21,8 +21,8 @@ export class BotsController {
     return this.botsService.listBots(req.user.id);
   }
 
-  @Get(':id')
-  async getOne(@Req() req: any, @Param('id') id: string) {
+  @Get(":id")
+  async getOne(@Req() req: any, @Param("id") id: string) {
     return this.botsService.getBot(req.user.id, id);
   }
 
@@ -31,8 +31,8 @@ export class BotsController {
     return this.botsService.createBot(req.user.id, body);
   }
 
-  @Patch(':id')
-  async update(@Req() req: any, @Param('id') id: string, @Body() body: any) {
+  @Patch(":id")
+  async update(@Req() req: any, @Param("id") id: string, @Body() body: any) {
     return this.botsService.updateBot(req.user.id, id, body);
   }
 }
