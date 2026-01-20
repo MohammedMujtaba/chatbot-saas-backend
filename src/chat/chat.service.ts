@@ -2,6 +2,7 @@ import { BadRequestException, Injectable } from "@nestjs/common";
 import OpenAI from "openai";
 import { supabaseAdmin } from "../supabase/supabase.client";
 import { BotsService } from "../bots/bots.service";
+import { ragReply } from "src/common/rag/ragChat";
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -83,100 +84,24 @@ export class ChatService {
 
     if (histErr) throw new BadRequestException(histErr.message);
 
-    // 3) Embed latest user message
-    const embedModel =
-      process.env.OPENAI_EMBED_MODEL || "text-embedding-3-small";
-    const emb = await openai.embeddings.create({
-      model: embedModel,
-      input: message.slice(0, 8000),
-    });
-    const queryEmbedding = emb.data?.[0]?.embedding;
-    if (!queryEmbedding) throw new BadRequestException("Failed to embed query");
+    const historyMessages = (history ?? []).map((m: any) => ({
+      role: m.role as "user" | "assistant",
+      content: m.content as string,
+    }));
 
-    // 4) Retrieve chunks
-    const { data: chunks, error: matchErr } = await supabaseAdmin.rpc(
-      "match_chunks_v2",
-      {
-        bot: botId,
-        query_embedding: queryEmbedding,
-        match_count: 8,
-      },
-    );
-    if (matchErr) throw new BadRequestException(matchErr.message);
-
-    const top = (chunks ?? []) as Array<{
-      url: string;
-      title: string | null;
-      content: string;
-      similarity: number;
-    }>;
-
-    const context = top
-      .map((c, i) => {
-        const t = (c.title ?? "").trim();
-        const header = t
-          ? `Source ${i + 1}: ${t} (${c.url})`
-          : `Source ${i + 1}: ${c.url}`;
-        return `${header}\n${c.content}`;
-      })
-      .join("\n\n---\n\n");
-
-    // 5) Build messages with history
-    const chatModel = process.env.OPENAI_CHAT_MODEL || "gpt-4o-mini";
-
-    const messages = [
-      {
-        role: "system" as const,
-        content:
-          `You are ${bot.name}, a helpful support assistant. ` +
-          `Use the provided context for factual details. ` +
-          `Maintain conversation continuity using the chat history. ` +
-          `If user says "yes/no", infer what it refers to from history and respond accordingly. ` +
-          `If it's truly ambiguous, ask one short clarifying question.`,
-      },
-      {
-        role: "system" as const,
-        content: `CONTEXT:\n${context || "No context found."}`,
-      },
-
-      // history
-      ...(history ?? []).map((m: any) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content as string,
-      })),
-    ];
-
-    const completion = await openai.chat.completions.create({
-      model: chatModel,
-      temperature: 0.2,
-      messages,
+    const { answer, sources } = await ragReply({
+      botId,
+      botName: bot.name,
+      message,
+      history: historyMessages,
     });
 
-    const answer =
-      completion.choices?.[0]?.message?.content ??
-      "Sorry, I could not generate a response.";
+    await supabaseAdmin.from("conversation_messages").insert({
+      conversation_id: conversationId,
+      role: "assistant",
+      content: answer,
+    });
 
-    // 6) Save assistant message
-    {
-      const { error } = await supabaseAdmin
-        .from("conversation_messages")
-        .insert({
-          conversation_id: conversationId,
-          role: "assistant",
-          content: answer,
-        });
-      if (error) throw new BadRequestException(error.message);
-    }
-
-    return {
-      answer,
-      conversationId,
-      sources: top.slice(0, 5).map((c) => ({
-        url: c.url,
-        title: c.title ?? undefined,
-        similarity: c.similarity,
-        snippet: c.content.slice(0, 220),
-      })),
-    };
+    return { answer, conversationId, sources };
   }
 }
