@@ -2,6 +2,7 @@ import "dotenv/config";
 import { load } from "cheerio";
 import { supabaseAdmin } from "../supabase/supabase.client";
 import OpenAI from "openai";
+import pdf from "pdf-parse";
 
 const POLL_MS = 3000;
 const MAX_PAGES = 25;
@@ -228,12 +229,87 @@ async function markSource(sourceId: string, patch: any) {
   if (error) throw error;
 }
 
+async function downloadFile(url: string): Promise<Buffer> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buffer = await res.arrayBuffer();
+    return Buffer.from(buffer);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function extractTextFromPdf(buffer: Buffer): Promise<string> {
+  const data = await pdf(buffer);
+  return data.text;
+}
+
 async function setBotStatus(botId: string, patch: any) {
   const { error } = await supabaseAdmin
     .from("bots")
     .update(patch)
     .eq("id", botId);
   if (error) throw error;
+}
+
+async function processFileSource(
+  sourceId: string,
+  botId: string,
+  fileUrl: string,
+) {
+  console.log(`[worker] processing file source=${sourceId} url=${fileUrl}`);
+
+  // Download the PDF file
+  const fileBuffer = await downloadFile(fileUrl);
+
+  // Extract text from PDF
+  const text = await extractTextFromPdf(fileBuffer);
+
+  if (!text || text.length < 100) {
+    throw new Error("PDF file is empty or too short");
+  }
+
+  console.log(`[worker] extracted ${text.length} characters from PDF`);
+
+  // Chunk the text
+  const chunks = chunkText(text);
+  if (chunks.length === 0) {
+    throw new Error("No valid chunks could be created from PDF");
+  }
+
+  let chunkCount = 0;
+
+  // Create embeddings for each chunk and store
+  for (let idx = 0; idx < chunks.length; idx++) {
+    const content = chunks[idx];
+
+    const embeddingText = `DOCUMENT CONTENT:\n${content}`;
+    const embedding = await embedText(embeddingText);
+
+    const { error } = await supabaseAdmin.from("document_chunks").insert({
+      bot_id: botId,
+      source_id: sourceId,
+      url: fileUrl,
+      chunk_index: idx,
+      title: "Uploaded PDF Document",
+      content,
+      embedding,
+    });
+
+    if (error) throw error;
+    chunkCount++;
+  }
+
+  console.log(`[worker] inserted ${chunkCount} chunks from PDF`);
+
+  await markSource(sourceId, {
+    status: "complete",
+    last_crawl_at: new Date().toISOString(),
+    last_error: null,
+  });
 }
 
 async function runOnce() {
@@ -243,77 +319,85 @@ async function runOnce() {
   const sourceId = source.id as string;
   const botId = source.bot_id as string;
   const startUrl = source.start_url as string;
+  const sourceType = source.type as string;
 
   console.log(
-    `[worker] picked source=${sourceId} bot=${botId} url=${startUrl}`,
+    `[worker] picked source=${sourceId} type=${sourceType} bot=${botId} url=${startUrl}`,
   );
 
   await markSource(sourceId, { status: "crawling", last_error: null });
   await setBotStatus(botId, { status: "training" });
 
   try {
-    const homepage = normalizeUrl(startUrl) || startUrl;
-    const homeHtml = await fetchHtml(homepage);
+    // Route based on source type
+    if (sourceType === "file") {
+      // Process file source (PDF)
+      await processFileSource(sourceId, botId, startUrl);
+    } else {
+      // Process website source (default behavior)
+      const homepage = normalizeUrl(startUrl) || startUrl;
+      const homeHtml = await fetchHtml(homepage);
 
-    const links = extractLinks(homepage, homeHtml);
+      const links = extractLinks(homepage, homeHtml);
 
-    const seeded = seedCommonPages(homepage);
+      const seeded = seedCommonPages(homepage);
 
-    const queue = Array.from(new Set([homepage, ...links, ...seeded])).slice(
-      0,
-      MAX_PAGES,
-    );
+      const queue = Array.from(new Set([homepage, ...links, ...seeded])).slice(
+        0,
+        MAX_PAGES,
+      );
 
-    console.log(`[worker] crawling ${queue.length} pages...`);
+      console.log(`[worker] crawling ${queue.length} pages...`);
 
-    let chunkCount = 0;
+      let chunkCount = 0;
 
-    for (const url of queue) {
-      let html = "";
-      try {
-        html = url === homepage ? homeHtml : await fetchHtml(url);
-      } catch (e: any) {
-        console.log(`[worker] skip ${url}: ${e.message}`);
-        continue;
+      for (const url of queue) {
+        let html = "";
+        try {
+          html = url === homepage ? homeHtml : await fetchHtml(url);
+        } catch (e: any) {
+          console.log(`[worker] skip ${url}: ${e.message}`);
+          continue;
+        }
+
+        const title = extractTitle(html);
+        const path = new URL(url).pathname;
+
+        const text = extractReadableText(html);
+        if (!text || text.length < 200) continue;
+
+        const chunks = chunkText(text);
+        if (chunks.length === 0) continue;
+
+        for (let idx = 0; idx < chunks.length; idx++) {
+          const content = chunks[idx];
+
+          const embeddingText = `TITLE: ${title}\nPATH: ${path}\nCONTENT:\n${content}`;
+          const embedding = await embedText(embeddingText);
+
+          const { error } = await supabaseAdmin.from("document_chunks").insert({
+            bot_id: botId,
+            source_id: sourceId,
+            url,
+            chunk_index: idx,
+            title,
+            content,
+            embedding,
+          });
+
+          if (error) throw error;
+          chunkCount++;
+        }
       }
 
-      const title = extractTitle(html);
-      const path = new URL(url).pathname;
+      console.log(`[worker] inserted ${chunkCount} chunks`);
 
-      const text = extractReadableText(html);
-      if (!text || text.length < 200) continue;
-
-      const chunks = chunkText(text);
-      if (chunks.length === 0) continue;
-
-      for (let idx = 0; idx < chunks.length; idx++) {
-        const content = chunks[idx];
-
-        const embeddingText = `TITLE: ${title}\nPATH: ${path}\nCONTENT:\n${content}`;
-        const embedding = await embedText(embeddingText);
-
-        const { error } = await supabaseAdmin.from("document_chunks").insert({
-          bot_id: botId,
-          source_id: sourceId,
-          url,
-          chunk_index: idx,
-          title,
-          content,
-          embedding,
-        });
-
-        if (error) throw error;
-        chunkCount++;
-      }
+      await markSource(sourceId, {
+        status: "complete",
+        last_crawl_at: new Date().toISOString(),
+        last_error: null,
+      });
     }
-
-    console.log(`[worker] inserted ${chunkCount} chunks`);
-
-    await markSource(sourceId, {
-      status: "complete",
-      last_crawl_at: new Date().toISOString(),
-      last_error: null,
-    });
 
     await setBotStatus(botId, {
       status: "live",
