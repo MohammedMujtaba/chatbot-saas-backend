@@ -54,7 +54,7 @@ export class BotsService {
     return (data ?? []).map((b: any) => this.mapBotRow(b));
   }
 
-  async createBot(userId: string, body: any) {
+  async createBot(userId: string, body: any, file?: any) {
     const workspaceId = await this.ensureProfileAndWorkspace(
       userId,
       body?.userName,
@@ -70,6 +70,36 @@ export class BotsService {
     if (!name) throw new BadRequestException("name is required");
     if (!domain) throw new BadRequestException("domain is required");
 
+    let fileUrl: string | null = null;
+
+    // Handle file upload to Supabase storage if provided
+    if (file) {
+      const fileExtension = file.originalname.split(".").pop();
+      const fileName = `${randomUUID()}.${fileExtension}`;
+      const filePath = `bots/${workspaceId}/${fileName}`;
+
+      const { data: uploadData, error: uploadError } =
+        await supabaseAdmin.storage
+          .from("bot-files")
+          .upload(filePath, file.buffer, {
+            contentType: file.mimetype,
+            upsert: false,
+          });
+
+      if (uploadError) {
+        throw new BadRequestException(
+          `File upload failed: ${uploadError.message}`,
+        );
+      }
+
+      // Get public URL for the uploaded file
+      const {
+        data: { publicUrl },
+      } = supabaseAdmin.storage.from("bot-files").getPublicUrl(filePath);
+
+      fileUrl = publicUrl;
+    }
+
     const embedKey = `bot_${randomUUID().replace(/-/g, "")}`;
 
     // Insert bot
@@ -79,6 +109,7 @@ export class BotsService {
         workspace_id: workspaceId,
         name,
         domain,
+        file: fileUrl,
         primary_color: primaryColor,
         welcome_message: welcomeMessage,
         status: "training",
@@ -97,6 +128,16 @@ export class BotsService {
       start_url: startUrl,
       status: "queued",
     });
+
+    // Insert file source if file was uploaded
+    if (fileUrl) {
+      await supabaseAdmin.from("sources").insert({
+        bot_id: bot.id,
+        type: "file",
+        start_url: fileUrl,
+        status: "queued",
+      });
+    }
 
     return {
       id: bot.id,

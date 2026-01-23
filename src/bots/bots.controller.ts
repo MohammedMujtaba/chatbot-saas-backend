@@ -8,7 +8,10 @@ import {
   Req,
   UseGuards,
   Delete,
+  UseInterceptors,
+  UploadedFile,
 } from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
 import { SupabaseJwtGuard } from "../auth/supabase-jwt.guard";
 import { BotsService } from "./bots.service";
 
@@ -28,8 +31,13 @@ export class BotsController {
   }
 
   @Post()
-  async create(@Req() req: any, @Body() body: any) {
-    return this.botsService.createBot(req.user.id, body);
+  @UseInterceptors(FileInterceptor("file"))
+  async create(
+    @Req() req: any,
+    @Body() body: any,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    return this.botsService.createBot(req.user.id, body, file);
   }
 
   @Patch(":id")
